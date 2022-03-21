@@ -12,65 +12,107 @@ import AVFoundation
 
 
 class AssetResourceLoader: NSObject  {
+        
+    private(set) var url: URL
     
-    private var requests = [AVAssetResourceLoadingRequest]()
+    private(set) var asset: AVURLAsset?
     
-    private var videoPath = NSSearchPathForDirectoriesInDomains(FileManager.SearchPathDirectory.cachesDirectory, .userDomainMask, true).last! + "/tmp.mp4"
-    private var task: URLSessionDownloadTask?
+    private var loadingRequests = [AVAssetResourceLoadingRequest]()
+
+    private var downloader: VideoDownloader?
     
-    private lazy var session: URLSession = {
-       let config = URLSessionConfiguration.default
-       config.isDiscretionary = true
-       return URLSession(configuration: config, delegate: self, delegateQueue: OperationQueue.main)
-    }()
+    init(url: URL) {
+        self.url = url
+        super.init()
+        self.resetLoader()
+    }
     
-    private var resumeData: Data?
+    private func resetLoader() {
+        var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        components?.scheme = "customscheme"
+        guard let fakeURL = components?.url else {
+            return
+        }
+        self.asset = AVURLAsset(url: fakeURL)
+        self.asset?.resourceLoader.setDelegate(self, queue: DispatchQueue.main)
+    }
+    
+    func checkLoadingRequestsState() {
+        loadingRequests.removeAll {configLoadingRequest(loadingRequest: $0)}
+    }
+    
+    func configLoadingRequest(loadingRequest: AVAssetResourceLoadingRequest) -> Bool{
+        guard let downloader = downloader,
+              let dataRequest = loadingRequest.dataRequest else {
+            return false
+        }
+        if let contentRequest = loadingRequest.contentInformationRequest {
+            contentRequest.contentType = "video/mp4"
+            contentRequest.isByteRangeAccessSupported = true
+            contentRequest.contentLength = Int64(downloader.totalLength)
+        }
+    
+//        print(dataRequest)
+        var requestOffset = dataRequest.requestedOffset
+        if dataRequest.currentOffset > 0 {
+            requestOffset = dataRequest.currentOffset
+        }
+        if #available(iOS 13, *) {
+            try? downloader.readFileHander?.seek(toOffset: UInt64(requestOffset))
+        }else {
+            downloader.readFileHander?.seek(toFileOffset: UInt64(requestOffset))
+        }
+        if downloader.cacheLength > dataRequest.currentOffset {
+            let length = Int(dataRequest.requestedLength) - Int(dataRequest.requestedOffset)
+            var data: Data?
+            if #available(iOS 13.4, *) {
+                data = try? downloader.readFileHander?.read(upToCount: length)
+            }else {
+                data = downloader.readFileHander?.readData(ofLength: length)
+            }
+            if let data = data {
+                dataRequest.respond(with: data)
+                loadingRequest.finishLoading()
+            }
+        }
+        return loadingRequest.isFinished
+    }
 }
 
 extension AssetResourceLoader: AVAssetResourceLoaderDelegate {
+    /*
+     1、可边下边播的前提是，视频文件的moov(container for all the metadata)需要在最前面，后面跟随mdat(media data container)
+     2、如果moov在最后，则需要整个文件下载完成才可以播放，此时超时时间大约18s
+     */
     func resourceLoader(_ resourceLoader: AVAssetResourceLoader, shouldWaitForLoadingOfRequestedResource loadingRequest: AVAssetResourceLoadingRequest) -> Bool {
-        requests.append(loadingRequest)
-        if task == nil {
-            guard let url = loadingRequest.request.url,
-                       var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
-                       return false
-                   }
-            components.scheme = "http"
-            task = session.downloadTask(with: components.url!)
-            task?.resume()
-            return true
-        }else if let resumeData = resumeData{
-            task = session.downloadTask(withResumeData: resumeData)
-            task?.resume()
-            return true
+        print("shouldWaitForLoadingOfRequestedResource")
+        loadingRequests.append(loadingRequest)
+        if self.downloader == nil {
+            downloader = VideoDownloader(url: url)
+            downloader?.delegate = self
+            downloader?.startDownload()
+        }else {
+            checkLoadingRequestsState()
         }
-        return false
+        return true
+    }
+    
+    func resourceLoader(_ resourceLoader: AVAssetResourceLoader, didCancel loadingRequest: AVAssetResourceLoadingRequest) {
+        loadingRequests.removeAll {$0 == loadingRequest}
     }
     
     func resourceLoader(_ resourceLoader: AVAssetResourceLoader, didCancel authenticationChallenge: URLAuthenticationChallenge) {
-        print(authenticationChallenge)
 
     }
-    
 }
 
-extension AssetResourceLoader: URLSessionDownloadDelegate {
+extension AssetResourceLoader: VideoDownloaderDelegate {
     
-    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
-        print(bytesWritten)
+    func downloader(downloader: VideoDownloader, didUpdateProress progress: Float) {
+        checkLoadingRequestsState()
     }
     
-    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didResumeAtOffset fileOffset: Int64, expectedTotalBytes: Int64) {
+    func downloader(downloader: VideoDownloader, didCompleteWithError error: Error?) {
         
     }
-    
-    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        print(error)
-
-    }
-    
-    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
-    }
-    
-    
 }
